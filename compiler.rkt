@@ -4,13 +4,6 @@
 
 (define *state* 0)
 
-(define (unique)
-  (set! *state* (+ *state* 1))
-  (string->symbol (string-append "__unique__" (number->string *state*))))
-
-(define (last-unique)
-  (string->symbol (string-append "__unique__" (number->string *state*))))
-
 (define datum? number?)
 (define identifier? symbol?)
 
@@ -71,13 +64,16 @@
   (Expr (e)
         (- (set id e))))
 
-; L3 with jumps instead of if expressions
-(define-language L4
-  (extends L3)
-  (Expr (e)
-        (+ (label id)
-           (jump-if-zero id e))
-        (- (if id e1 e2))))
+; Register-allocated version of L3
+;(define-language L4
+;  (extends L3)
+;  (terminals
+;   (+ (register (reg))
+;      (stack-ref (stk))))
+;  (Expr (e)
+;        (- id)
+;        (+ reg)
+;        (+ stk)))
 
 (define-pass group-exprs : L0 (src) -> L1 ()
   (Expr : Expr (e) -> Expr ()
@@ -96,19 +92,20 @@
 (define-pass un-nest : L1 (src) -> L2 ()
   (definitions
     (define (make-binding e)
-      (with-output-language (L2 Expr) 
-        (cons `(var ,(unique) ,e) `,(last-unique)))))
+      (let ([s (gensym)])
+        (with-output-language (L2 Expr) 
+          (cons `(var ,s ,e) `,s)))))
   (Expr : Expr (e) -> Expr ()
-          [(if ,[e0] ,[e1] ,[e2])
+        [(if ,[e0] ,[e1] ,[e2])
+         (let ([s (gensym)])
            `(begin
-              (var ,(unique) ,e0)
-              (if ,(last-unique) ,e1 ,e2))]
-          [(,id ,[e*] ...)
-           (let ([vars (map make-binding e*)])
-             (with-output-language (L2 Expr)
-                   `(begin
-                      ,(map car vars) ...
-                      (id ,(map cdr vars) ...))))]))
+              (var ,s ,e0)
+              (if ,s ,e1 ,e2)))]
+        [(,id ,[e*] ...)
+         (let ([vars (map make-binding e*)])
+           `(begin
+              ,(map car vars) ...
+              (,id ,(map cdr vars) ...)))]))
 
 (un-nest
  (group-exprs
