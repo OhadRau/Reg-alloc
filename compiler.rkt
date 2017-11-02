@@ -66,6 +66,15 @@
            (jmp id)
            (label id))))
 
+; Linear syntax (no arbitrary nesting)
+(define-language L4
+  (extends L3)
+  (Expr (e)
+        (- (begin e* ...)))
+  (Defun (def)
+         (- (defun (id0 id* ...) e))
+         (+ (defun (id0 id* ...) e* ...))))
+
 (define (register? reg)
   (member reg '(eax ebx ecx edx esi edi ebp esp)))
 
@@ -73,9 +82,9 @@
   (and (number? stk)
        (< stk 0)))
 
-; Register-allocated version of L3
-(define-language L4
-  (extends L3)
+; Register-allocated version of L4
+(define-language L5
+  (extends L4)
   (terminals
    (+ (register (reg))
       (stack-ref (stk))))
@@ -135,7 +144,7 @@
             ,e0
             (label ,lblDone)))]))
 
-; Flatten var/set expressions before flattening
+; Flatten `var`/`set` expressions before flattening `begin`s
 (define-pass flatten-assignments : L3 (src) -> L3 ()
   (Expr : Expr (e) -> Expr ()
         [(var ,id (begin ,e* ... ,e))
@@ -159,23 +168,29 @@
            [(defun (,id0 ,id* ...) (begin ,e* ...))
             `(defun (,id0 ,id* ...) (begin ,(foldr append '() (map flatten-expr e*)) ...))]))
 
-; Collect the list of all variables defined in an expr
-(define (vars varset expr)
-  (nanopass-case (L3 Expr) expr
+; Replace the (begin e* ...) of a function body with e* ...
+(define-pass unwrap-fn-body : L3 (src) -> L4 ()
+  (Defun : Defun (def) -> Defun ()
+         [(defun (,id0 ,id* ...) (begin ,[e*] ...))
+          `(defun (,id0 ,id* ...) ,e* ...)]
+         [(defun (,id0 ,id* ...) ,e)
+          `(defun (,id0 ,id* ...) ,e)]))
+
+; Collect the list of all variables in an expression
+(define (expr-vars varset expr)
+  (nanopass-case (L4 Expr) expr
                  [,id
                   (set-add varset id)]
                  [,d
                   varset]
                  [(var ,id ,e)
                   (let ([varset* (set-add varset id)])
-                    (vars varset* e))]
+                    (expr-vars varset* e))]
                  [(set ,id ,e)
                   (let ([varset* (set-add varset id)])
-                    (vars varset* e))]
+                    (expr-vars varset* e))]
                  [(,id ,id* ...)
                   (foldr (lambda (e s) (set-add s e)) varset id*)]
-                 [(begin ,e* ...)
-                  (foldr (lambda (e s) (vars s e)) varset e*)]
                  [(label ,id)
                   varset]
                  [(jmp ,id)
@@ -183,26 +198,72 @@
                  [(jnz ,id0 ,id1)
                   varset]))
 
-; Check if a variable is live in an expr
-(define (live? id expr)
-  #t)
+; Collect all variables in a list of expressions
+(define (vars exprs)
+  (foldr (lambda (e s) (expr-vars s e)) (set) exprs))
 
-(define-pass print-vars : L3 (src) -> L3 ()
+(define (in exprs)
+  (if (null? exprs)
+      (set)
+      (set-union (use (car exprs)) (set-subtract (out exprs) (def (car exprs))))))
+
+(define (out exprs)
+  (in (cdr exprs)))
+
+(define (def expr)
+  (nanopass-case (L4 Expr) expr
+                 [(var ,id ,e)
+                  (set id)]
+                 [else
+                  (set)]))
+
+(define (use expr)
+  (nanopass-case (L4 Expr) expr
+                 [,id
+                  (set id)]
+                 [(var ,id ,e)
+                  (use e)]
+                 [(set ,id ,e)
+                  (use e)]
+                 [(,id ,id* ...)
+                  (apply set id*)]
+                 [(jnz ,id0 ,id1)
+                  (set id0)]
+                 [else
+                  (set)]))
+
+; Print the set of variables in each function
+(define-pass print-vars : L4 (src) -> L4 ()
   (Defun : Defun (def) -> Defun ()
-         [(defun (,id0 ,id* ...) ,e)
-          (writeln (vars (set) e))
+         [(defun (,id0 ,id* ...) ,e* ...)
+          (writeln (vars e*))
           def]))
 
-(print-vars
- (flatten
-  (flatten-assignments
-   (expand-if
-    (un-nest
-     (group-exprs
-      (parse-L0
-       `((defun (f x)
-           (if (> x 0)
-               (- x 1)
-               (begin
-                 (var y 1)
-                 (* x y))))))))))))
+(define-pass print-in : L4 (src) -> L4 ()
+  (definitions
+    (define (loop exprs)
+      (if (null? exprs)
+          '()
+          (begin
+            (writeln (in exprs))
+            (loop (cdr exprs))))))
+  (Defun : Defun (def) -> Defun ()
+         [(defun (,id0 ,id* ...) ,e* ...)
+          (writeln (loop e*))
+          def]))
+
+(print-in
+ (print-vars
+  (unwrap-fn-body
+   (flatten
+    (flatten-assignments
+     (expand-if
+      (un-nest
+       (group-exprs
+        (parse-L0
+         `((defun (f x)
+             (if (> x 0)
+                 (- x 1)
+                 (begin
+                   (var y 1)
+                   (* x y))))))))))))))
