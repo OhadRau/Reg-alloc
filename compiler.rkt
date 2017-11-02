@@ -1,5 +1,6 @@
 #lang nanopass
 
+(require racket/set)
 (require nanopass/base)
 
 (define datum? number?)
@@ -56,23 +57,38 @@
         (+ (if id e1 e2)
            (id id* ...))))
 
-; SSA version of L2 (removes `set`)
+; L2 with jumps instead of if expressions
 (define-language L3
   (extends L2)
   (Expr (e)
-        (+ (phi id0 id1 id2))
-        (- (set id e))))
+        (- (if id e1 e2))
+        (+ (jnz id0 id1)
+           (jmp id)
+           (label id))))
+
+(define (register? reg)
+  (member reg '(eax ebx ecx edx esi edi ebp esp)))
+
+(define (stack-ref? stk)
+  (and (number? stk)
+       (< stk 0)))
 
 ; Register-allocated version of L3
-;(define-language L4
-;  (extends L3)
-;  (terminals
-;   (+ (register (reg))
-;      (stack-ref (stk))))
-;  (Expr (e)
-;        (- id)
-;        (+ reg)
-;        (+ stk)))
+(define-language L4
+  (extends L3)
+  (terminals
+   (+ (register (reg))
+      (stack-ref (stk))))
+  (Expr (e)
+        (- id
+           (var id e)
+           (set id e))
+        (+ (val reg)
+           (val stk)
+           (var reg e)
+           (var stk e)
+           (set reg e)
+           (set stk e))))
 
 (define-pass group-exprs : L0 (src) -> L1 ()
   (Expr : Expr (e) -> Expr ()
@@ -106,83 +122,87 @@
               ,(map car vars) ...
               (,id ,(map cdr vars) ...)))]))
 
+(define-pass expand-if : L2 (src) -> L3 ()
+  (Expr : Expr (e) -> Expr ()
+        [(if ,id ,[e0] ,[e1])
+         (let ([lblTrue (gensym)]
+               [lblDone (gensym)])
+         `(begin
+            (jnz ,id ,lblTrue)
+            ,e1
+            (jmp ,lblDone)
+            (label ,lblTrue)
+            ,e0
+            (label ,lblDone)))]))
+
+; Flatten var/set expressions before flattening
+(define-pass flatten-assignments : L3 (src) -> L3 ()
+  (Expr : Expr (e) -> Expr ()
+        [(var ,id (begin ,e* ... ,e))
+         `(begin
+            ,e* ...
+            (var ,id ,e))]
+        [(set ,id (begin ,e* ... ,e))
+         `(begin
+            ,e* ...
+            (set ,id ,e))]))
+
 ; Remove (some) redundant `begin`s (e.g. (begin (begin x...) y...) => (begin x... y...))
-(define-pass flatten : L2 (src) -> L2 ()
+(define-pass flatten : L3 (src) -> L3 ()
   (definitions
     (define (flatten-expr expr)
-      (nanopass-case (L2 Expr) expr
+      (nanopass-case (L3 Expr) expr
                      [(begin ,e* ...)
                       (foldr append '() (map flatten-expr e*))]
-                     [(var ,id (begin ,e* ...))
-                      (list (with-output-language (L2 Expr)
-                              `(var ,id (begin ,(foldr append '() (map flatten-expr e*)) ...))))]
-                     [(var ,id ,e)
-                      (list (with-output-language (L2 Expr)
-                              `(var ,id (begin ,(flatten-expr e) ...))))]
-                     [(set ,id (begin ,e* ...))
-                      (list (with-output-language (L2 Expr)
-                              `(set ,id (begin ,(foldr append '() (map flatten-expr e*)) ...))))]
-                     [(set ,id ,e)
-                      (list (with-output-language (L2 Expr)
-                              `(set ,id (begin ,(flatten-expr e) ...))))]
-                     [(if ,id (begin ,e1* ...) (begin ,e2* ...))
-                      (list (with-output-language (L2 Expr)
-                        `(if ,id (begin ,(foldr append '() (map flatten-expr e1*)) ...) (begin ,(foldr append '() (map flatten-expr e2*)) ...))))]
-                     [(if ,id (begin ,e1* ...) ,e2)
-                      (list (with-output-language (L2 Expr)
-                              `(if ,id (begin ,(foldr append '() (map flatten-expr e1*)) ...) (begin ,(flatten-expr e2) ...))))]
-                     [(if ,id ,e1 (begin ,e2* ...))
-                      (list (with-output-language (L2 Expr)
-                              `(if ,id (begin ,(flatten-expr e1) ...) (begin ,(foldr append '() (map flatten-expr e2*)) ...))))]
-                     [(if ,id ,e1 ,e2)
-                      (list (with-output-language (L2 Expr)
-                              `(if ,id (begin ,(flatten-expr e1) ...) (begin ,(flatten-expr e2) ...))))]
                      [else (list expr)])))
     (Defun : Defun (def) -> Defun ()
            [(defun (,id0 ,id* ...) (begin ,e* ...))
             `(defun (,id0 ,id* ...) (begin ,(foldr append '() (map flatten-expr e*)) ...))]))
 
-(define-pass ssa : L2 (src) -> L3 ()
-  (definitions
-    (define (extend-env var env)
-      (cons (cons var (gensym)) env))
-    (define (create-env vars)
-      (foldr (lambda (x lst) (cons (cons x x) lst)) '() vars))
-    (define (lookup var env)
-      (let ([assoc (assq var env)])
-        (if (list? assoc)
-            (cdr assoc)
-            '__undefined-identifier)))
-    (define (apply-ssa env expr)
-      (nanopass-case (L2 Expr) expr
-                     [,id
-                      (cons env `,(lookup id env))]
-                     [(var ,id ,e)
-                      (let ([env* (extend-env id env)])
-                      (cons env* `(var ,(lookup id env*) ,(cdr (apply-ssa env e)))))]
-                     [(set ,id ,e)
-                      (let ([env* (extend-env id env)])
-                        (cons env* `(var ,(lookup id env*) ,(cdr (apply-ssa env e)))))]
-                     [else (cons env expr)])))
-  (Defun : Defun (def) -> Defun ()
-         [(defun (,id0 ,id* ...) ,e)
-          `(defun (,id0 ,id* ...) ,(apply-ssa (create-env id*) e))]))
-
 ; Collect the list of all variables defined in an expr
-(define (vars expr)
-  '())
+(define (vars varset expr)
+  (nanopass-case (L3 Expr) expr
+                 [,id
+                  (set-add varset id)]
+                 [,d
+                  varset]
+                 [(var ,id ,e)
+                  (let ([varset* (set-add varset id)])
+                    (vars varset* e))]
+                 [(set ,id ,e)
+                  (let ([varset* (set-add varset id)])
+                    (vars varset* e))]
+                 [(,id ,id* ...)
+                  (foldr (lambda (e s) (set-add s e)) varset id*)]
+                 [(begin ,e* ...)
+                  (foldr (lambda (e s) (vars s e)) varset e*)]
+                 [(label ,id)
+                  varset]
+                 [(jmp ,id)
+                  varset]
+                 [(jnz ,id0 ,id1)
+                  varset]))
 
 ; Check if a variable is live in an expr
 (define (live? id expr)
   #t)
 
-(flatten
- (un-nest
-  (group-exprs
-   (parse-L0
-    `((defun (f x)
-        (if (> x 0)
-            (- x 1)
-            (begin
-              (var y 1)
-              (* x y)))))))))
+(define-pass print-vars : L3 (src) -> L3 ()
+  (Defun : Defun (def) -> Defun ()
+         [(defun (,id0 ,id* ...) ,e)
+          (writeln (vars (set) e))
+          def]))
+
+(print-vars
+ (flatten
+  (flatten-assignments
+   (expand-if
+    (un-nest
+     (group-exprs
+      (parse-L0
+       `((defun (f x)
+           (if (> x 0)
+               (- x 1)
+               (begin
+                 (var y 1)
+                 (* x y))))))))))))
