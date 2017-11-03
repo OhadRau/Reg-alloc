@@ -1,6 +1,8 @@
 #lang nanopass
 
+(require graph)
 (require racket/set)
+(require racket/match)
 (require nanopass/base)
 
 (define datum? number?)
@@ -75,8 +77,9 @@
          (- (defun (id0 id* ...) e))
          (+ (defun (id0 id* ...) e* ...))))
 
+(define registers '(eax ebx ecx edx esi edi ebp esp))
 (define (register? reg)
-  (member reg '(eax ebx ecx edx esi edi ebp esp)))
+  (member reg registers))
 
 (define (stack-ref? stk)
   (and (number? stk)
@@ -88,16 +91,19 @@
   (terminals
    (+ (register (reg))
       (stack-ref (stk))))
+  (Ref (r)
+       (+ (register reg)
+          (stack-ref stk)))
   (Expr (e)
         (- id
            (var id e)
-           (set id e))
-        (+ (val reg)
-           (val stk)
-           (var reg e)
-           (var stk e)
-           (set reg e)
-           (set stk e))))
+           (set id e)
+           (id id* ...)
+           (jnz id0 id1))
+        (+ (ref r)
+           (set r e)
+           (id r* ...)
+           (jnz r id1))))
 
 (define-pass group-exprs : L0 (src) -> L1 ()
   (Expr : Expr (e) -> Expr ()
@@ -232,6 +238,14 @@
                  [else
                   (set)]))
 
+(define (pairs verts)
+  (combinations verts 2))
+
+(define (expr->edges exprs)
+  (if (null? exprs)
+      '()
+      (append (pairs (set->list (in exprs))) (expr->edges (cdr exprs)))))
+
 ; Print the set of variables in each function
 (define-pass print-vars : L4 (src) -> L4 ()
   (Defun : Defun (def) -> Defun ()
@@ -239,31 +253,104 @@
           (writeln (vars e*))
           def]))
 
-(define-pass print-in : L4 (src) -> L4 ()
+(define (count-uses var exprs)
+  (match exprs
+    ['() 0]
+    [(cons x xs)
+     (+ (count-uses var xs)
+        (nanopass-case (L4 Expr) x
+                       [,id
+                        (if (equal? id var) 1 0)]
+                       [,d
+                        0]
+                       [(var ,id ,e)
+                        (+ (if (equal? id var) 1 0) (count-uses var (list e)))]
+                       [(set ,id ,e)
+                        (+ (if (equal? id var) 1 0) (count-uses var (list e)))]
+                       [(,id ,id* ...)
+                        (length (filter (lambda (id) (equal? id var)) id*))]
+                       [(label ,id)
+                        0]
+                       [(jmp ,id)
+                        0]
+                       [(jnz ,id0 ,id1)
+                        (if (equal? id0 var) 1 0)]))]))
+
+(define (color-weights coloring exprs)
+  (let ([*weights* (make-hash)])
+    (hash-for-each coloring
+                   (lambda (var color)
+                     (hash-set! *weights* color (+ (hash-ref *weights* color 0) (count-uses var exprs)))))
+    *weights*))
+
+(define (index->ref i)
+  (with-output-language (L5 Ref)
+    (if (< i (length registers))
+        `(register ,(list-ref registers i))
+        `(stack-ref ,(- (* 4 i))))))
+
+(define (map-colors weights)
+  (let ([order
+         (sort weights >
+               #:key (lambda (pair)
+                       (match pair
+                         [(cons color weight) weight])))])
+    (for/list ([color order]
+               [index (length order)])
+      (cons (car color) (index->ref index)))))
+
+(define-pass reg-alloc : L4 (src) -> L5 ()
   (definitions
-    (define (loop exprs)
-      (if (null? exprs)
-          '()
-          (begin
-            (writeln (in exprs))
-            (loop (cdr exprs))))))
+    (define (col id coloring mapping)
+      (cdr (assoc (hash-ref coloring id) mapping)))
+    (define (apply-colors e coloring mapping)
+      (nanopass-case (L4 Expr) e
+                     [,id
+                      (with-output-language (L5 Expr)
+                        `(ref ,(col id coloring mapping)))]
+                     [,d
+                      (with-output-language (L5 Expr)
+                        `,d)]
+                     [(var ,id ,e)
+                      (with-output-language (L5 Expr)
+                        `(set ,(col id coloring mapping) ,(apply-colors e coloring mapping)))]
+                     [(set ,id ,e)
+                      (with-output-language (L5 Expr)
+                        `(set ,(col id coloring mapping) ,(apply-colors e coloring mapping)))]
+                     [(,id ,id* ...)
+                      (with-output-language (L5 Expr)
+                        `(,id ,(map (lambda (id) (col id coloring mapping)) id*) ...))]
+                     [(label ,id)
+                      (with-output-language (L5 Expr)
+                        `(label ,id))]
+                     [(jmp ,id)
+                      (with-output-language (L5 Expr)
+                        `(jmp ,id))]
+                     [(jnz ,id0 ,id1)
+                      (with-output-language (L5 Expr)
+                        `(jnz ,(col id0 coloring mapping) ,id1))])))
   (Defun : Defun (def) -> Defun ()
          [(defun (,id0 ,id* ...) ,e* ...)
-          (writeln (loop e*))
-          def]))
+          (let* ([graph (unweighted-graph/undirected (expr->edges e*))]
+                 [vars (set->list (vars e*))]
+                 [num-vars (length vars)]
+                 [colors (coloring graph num-vars)]
+                 [weights (color-weights colors e*)]
+                 [mapped (map-colors (hash->list weights))]
+                 [alloced (map (lambda (e) (apply-colors e colors mapped)) e*)])
+            `(defun (,id0 ,id* ...) ,alloced ...))]))
 
-(print-in
- (print-vars
-  (unwrap-fn-body
-   (flatten
-    (flatten-assignments
-     (expand-if
-      (un-nest
-       (group-exprs
-        (parse-L0
-         `((defun (f x)
-             (if (> x 0)
-                 (- x 1)
-                 (begin
-                   (var y 1)
-                   (* x y))))))))))))))
+(reg-alloc
+ (unwrap-fn-body
+  (flatten
+   (flatten-assignments
+    (expand-if
+     (un-nest
+      (group-exprs
+       (parse-L0
+        `((defun (f x)
+            (if (> x 0)
+                (- x 1)
+                (begin
+                  (var y 1)
+                  (* x y)))))))))))))
