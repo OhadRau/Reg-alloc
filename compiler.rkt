@@ -160,15 +160,15 @@
 ; Flatten `var`/`set`/`return` expressions before flattening `begin`s
 (define-pass flatten-assignments : L3 (src) -> L3 ()
   (Expr : Expr (e) -> Expr ()
-        [(var ,id (begin ,e* ... ,e))
+        [(var ,id (begin ,[e*] ... ,[e]))
          `(begin
             ,e* ...
             (var ,id ,e))]
-        [(set ,id (begin ,e* ... ,e))
+        [(set ,id (begin ,[e*] ... ,[e]))
          `(begin
             ,e* ...
             (set ,id ,e))]
-        [(return (begin ,e* ... ,e))
+        [(return (begin ,[e*] ... ,[e]))
          `(begin
             ,e* ...
             (return ,e))]))
