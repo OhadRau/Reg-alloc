@@ -31,7 +31,8 @@
         (set id e)
         (if e0 e1 e2)
         (id e* ...)
-        (begin e* ...))
+        (begin e* ...)
+        (return e))
   (Defun (def)
          (defun (id0 id* ...) e* ...))
   (Program (prog)
@@ -150,7 +151,7 @@
             ,e0
             (label ,lblDone)))]))
 
-; Flatten `var`/`set` expressions before flattening `begin`s
+; Flatten `var`/`set`/`return` expressions before flattening `begin`s
 (define-pass flatten-assignments : L3 (src) -> L3 ()
   (Expr : Expr (e) -> Expr ()
         [(var ,id (begin ,e* ... ,e))
@@ -160,7 +161,11 @@
         [(set ,id (begin ,e* ... ,e))
          `(begin
             ,e* ...
-            (set ,id ,e))]))
+            (set ,id ,e))]
+        [(return (begin ,e* ... ,e))
+         `(begin
+            ,e* ...
+            (return ,e))]))
 
 ; Remove (some) redundant `begin`s (e.g. (begin (begin x...) y...) => (begin x... y...))
 (define-pass flatten : L3 (src) -> L3 ()
@@ -199,6 +204,8 @@
                   (foldr (lambda (e s) (set-add s e)) varset id*)]
                  [(label ,id)
                   varset]
+                 [(return ,e)
+                  (expr-vars varset e)]
                  [(jmp ,id)
                   varset]
                  [(jnz ,id0 ,id1)
@@ -233,6 +240,8 @@
                   (use e)]
                  [(,id ,id* ...)
                   (apply set id*)]
+                 [(return ,e)
+                  (use e)]
                  [(jnz ,id0 ,id1)
                   (set id0)]
                  [else
@@ -269,6 +278,8 @@
                         (+ (if (equal? id var) 1 0) (count-uses var (list e)))]
                        [(,id ,id* ...)
                         (length (filter (lambda (id) (equal? id var)) id*))]
+                       [(return ,e)
+                        (count-uses var (list e))]
                        [(label ,id)
                         0]
                        [(jmp ,id)
@@ -290,11 +301,7 @@
         `(stack-ref ,(- (* 4 i))))))
 
 (define (map-colors weights)
-  (let ([order
-         (sort weights >
-               #:key (lambda (pair)
-                       (match pair
-                         [(cons color weight) weight])))])
+  (let ([order (sort weights > #:key cdr)])
     (for/list ([color order]
                [index (length order)])
       (cons (car color) (index->ref index)))))
@@ -320,6 +327,9 @@
                      [(,id ,id* ...)
                       (with-output-language (L5 Expr)
                         `(,id ,(map (lambda (id) (col id coloring mapping)) id*) ...))]
+                     [(return ,e)
+                      (with-output-language (L5 Expr)
+                        `(return ,(apply-colors e coloring mapping)))]
                      [(label ,id)
                       (with-output-language (L5 Expr)
                         `(label ,id))]
@@ -353,4 +363,4 @@
                 (- x 1)
                 (begin
                   (var y 1)
-                  (* x y)))))))))))))
+                  (return (* x y))))))))))))))
