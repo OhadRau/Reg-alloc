@@ -38,10 +38,11 @@
   (Program (prog)
            (def* ...)))
 
+; Generate a sexpr->L0 parser
 (define-parser parse-L0 L0)
 
 ; Example:
-; (parse-L0 `((defun (f x) (if (> x 0) (- x 1) (begin (var y 1) (* x y))))))
+; (parse-L0 `((defun (f x) (if (> x 0) (return (- x 1)) (begin (var y 1) (return (* x y)))))))
 
 ; Remove e ... forms and replace with (begin e ...)
 (define-language L1
@@ -78,15 +79,17 @@
          (- (defun (id0 id* ...) e))
          (+ (defun (id0 id* ...) e* ...))))
 
-(define registers '(eax ebx ecx edx esi edi ebp esp))
+; List of registers available to the register allocation algorithm
+(define registers '(eax ebx ecx edx esi edi))
 (define (register? reg)
   (member reg registers))
 
+; Check if a stack reference is valid (negative number)
 (define (stack-ref? stk)
   (and (number? stk)
        (< stk 0)))
 
-; Register-allocated version of L4
+; Register-allocated version of L4 (replace variable identifiers with registers/stack-ref)
 (define-language L5
   (extends L4)
   (terminals
@@ -106,6 +109,7 @@
            (id r* ...)
            (jnz r id1))))
 
+; Replace bare expressions with (begin ...) to ease flattening and un-nesting
 (define-pass group-exprs : L0 (src) -> L1 ()
   (Expr : Expr (e) -> Expr ()
         [(if ,[e0] (begin ,[e1*] ...) (begin ,[e2*] ...))
@@ -120,6 +124,7 @@
          [(defun (,id0 ,id* ...) ,[e*] ...)
           `(defun (,id0 ,id* ...) (begin ,e* ...))]))
 
+; Convert functions and conditionals to A-normal form (remove nested expressions and replace with variable references where possible without side-effects)
 (define-pass un-nest : L1 (src) -> L2 ()
   (definitions
     (define (make-binding e)
@@ -138,6 +143,7 @@
               ,(map car vars) ...
               (,id ,(map cdr vars) ...)))]))
 
+; Replace the if expression syntax with jump-based conditionals to create a linear AST without any nested expressions
 (define-pass expand-if : L2 (src) -> L3 ()
   (Expr : Expr (e) -> Expr ()
         [(if ,id ,[e0] ,[e1])
@@ -215,21 +221,27 @@
 (define (vars exprs)
   (foldr (lambda (e s) (expr-vars s e)) (set) exprs))
 
+; Get the live variables upon entering (car exprs)
 (define (in exprs)
   (if (null? exprs)
       (set)
       (set-union (use (car exprs)) (set-subtract (out exprs) (def (car exprs))))))
 
+; Get the live variables upon exiting (car exprs)
 (define (out exprs)
   (in (cdr exprs)))
 
+; Get the set of variables assigned in expr
 (define (def expr)
   (nanopass-case (L4 Expr) expr
                  [(var ,id ,e)
                   (set id)]
+                 [(set ,id ,e)
+                  (set id)]
                  [else
                   (set)]))
 
+; Get the set of variables used in expr
 (define (use expr)
   (nanopass-case (L4 Expr) expr
                  [,id
@@ -247,21 +259,20 @@
                  [else
                   (set)]))
 
+; Split a list of vertices into a complete graph of those edges
+; E.g.: (pairs '(a b c d e)) => '((a b) (a c) (a d) (a e) (b c) (b d) (b e) (c d) (c e) (d e))
 (define (pairs verts)
   (combinations verts 2))
 
-(define (expr->edges exprs)
+; Get the edges of an interference graph of a list of expressions
+; Interference is defined as the state in which 2 variables a, b are members of (in e)
+; Such that any set of variables live upon entering an expression form a complete induced subgraph of the register interference graph
+(define (exprs->edges exprs)
   (if (null? exprs)
       '()
-      (append (pairs (set->list (in exprs))) (expr->edges (cdr exprs)))))
+      (append (pairs (set->list (in exprs))) (exprs->edges (cdr exprs)))))
 
-; Print the set of variables in each function
-(define-pass print-vars : L4 (src) -> L4 ()
-  (Defun : Defun (def) -> Defun ()
-         [(defun (,id0 ,id* ...) ,e* ...)
-          (writeln (vars e*))
-          def]))
-
+; Count the number of times the identifier `var` is used in a list of expressions
 (define (count-uses var exprs)
   (match exprs
     ['() 0]
@@ -287,6 +298,8 @@
                        [(jnz ,id0 ,id1)
                         (if (equal? id0 var) 1 0)]))]))
 
+; Sum the weights of each color used in the register interference graph
+; Weight is defined as the number of uses of a variable, such that the color with the greatest weight represents the color that is accessed/assigned to more than any other color
 (define (color-weights coloring exprs)
   (let ([*weights* (make-hash)])
     (hash-for-each coloring
@@ -294,18 +307,24 @@
                      (hash-set! *weights* color (+ (hash-ref *weights* color 0) (count-uses var exprs)))))
     *weights*))
 
+; Convert an index `i` of a color into a valid reference (register name or stack reference)
+; Either registers[i] or -(4 * (i - #registers)) if i >= #registers
 (define (index->ref i)
   (with-output-language (L5 Ref)
     (if (< i (length registers))
         `(register ,(list-ref registers i))
-        `(stack-ref ,(- (* 4 i))))))
+        `(stack-ref ,(- (* 4 (- i (length registers))))))))
 
+; Map the set of colors to valid references (using index->ref), favoring the colors with the greatest weight first
+; Variables with the most uses get priority, so the more times a color is used the more likely it is to be placed in a register
 (define (map-colors weights)
   (let ([order (sort weights > #:key cdr)])
     (for/list ([color order]
                [index (length order)])
       (cons (car color) (index->ref index)))))
 
+; Allocate registers based on variable->color and color->reference mappings
+; Applies each individual algorithm to and then replace the variables with actual references
 (define-pass reg-alloc : L4 (src) -> L5 ()
   (definitions
     (define (col id coloring mapping)
@@ -341,7 +360,7 @@
                         `(jnz ,(col id0 coloring mapping) ,id1))])))
   (Defun : Defun (def) -> Defun ()
          [(defun (,id0 ,id* ...) ,e* ...)
-          (let* ([graph (unweighted-graph/undirected (expr->edges e*))]
+          (let* ([graph (unweighted-graph/undirected (exprs->edges e*))]
                  [vars (set->list (vars e*))]
                  [num-vars (length vars)]
                  [colors (coloring graph num-vars)]
@@ -350,17 +369,26 @@
                  [alloced (map (lambda (e) (apply-colors e colors mapped)) e*)])
             `(defun (,id0 ,id* ...) ,alloced ...))]))
 
-(reg-alloc
- (unwrap-fn-body
-  (flatten
-   (flatten-assignments
-    (expand-if
-     (un-nest
-      (group-exprs
-       (parse-L0
-        `((defun (f x)
-            (if (> x 0)
-                (- x 1)
-                (begin
-                  (var y 1)
-                  (return (* x y))))))))))))))
+; Apply all compilation passes to an s-expression
+(define (compile program)
+  (reg-alloc
+   (unwrap-fn-body
+    (flatten
+     (flatten-assignments
+      (expand-if
+       (un-nest
+        (group-exprs
+         (parse-L0 program)))))))))
+
+; Read/Eval/Print/Loop that calls out to compile to evaluate input
+(define (repl)
+  (display "Regalloc> ")
+  (let ([input (read (current-input-port))])
+    (println (compile input))
+    (repl)))
+
+; Run a REPL
+(repl)
+
+; Example program to paste into REPL:
+; ((defun (f x) (if (> x 0) (return (- x 1)) (begin (var y 1) (return (* x y))))))
