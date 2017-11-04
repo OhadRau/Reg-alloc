@@ -83,11 +83,7 @@
 (define registers '(eax ebx ecx edx esi edi))
 (define (register? reg)
   (member reg registers))
-
-; Check if a stack reference is valid (negative number)
-(define (stack-ref? stk)
-  (and (number? stk)
-       (< stk 0)))
+(define stack-ref? number?)
 
 ; Register-allocated version of L4 (replace variable identifiers with registers/stack-ref)
 (define-language L5
@@ -107,7 +103,10 @@
         (+ (ref r)
            (set r e)
            (id r* ...)
-           (jnz r id1))))
+           (jnz r id1)))
+  (Defun (def)
+         (- (defun (id0 id* ...) e* ...))
+         (+ (defun (id0 r* ...) e* ...))))
 
 ; Replace bare expressions with (begin ...) to ease flattening and un-nesting
 (define-pass group-exprs : L0 (src) -> L1 ()
@@ -366,8 +365,9 @@
                  [colors (coloring graph num-vars)]
                  [weights (color-weights colors e*)]
                  [mapped (map-colors (hash->list weights))]
-                 [alloced (map (lambda (e) (apply-colors e colors mapped)) e*)])
-            `(defun (,id0 ,id* ...) ,alloced ...))]))
+                 [alloced (map (lambda (e) (apply-colors e colors mapped)) e*)]
+                 [params (map (lambda (id) (col id colors mapped)) id*)])
+            `(defun (,id0 ,params ...) ,alloced ...))]))
 
 ; Apply all compilation passes to an s-expression
 (define (compile program)
