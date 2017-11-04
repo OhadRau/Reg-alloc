@@ -32,7 +32,7 @@ Register allocation using graph coloring with Racket + Nanopass
 
 ```lisp
 (
-(defun (f x)
+(defun (f (register ecx))
   (set (register eax) (ref (register ebx)))
   (set (register ecx) 0)
   (set (register eax) (> (register eax) (register ecx)))
@@ -48,7 +48,7 @@ Register allocation using graph coloring with Racket + Nanopass
   (return (- (register eax) (register ebx))) 
   (label g520500))
 
-(defun (g x)
+(defun (g (register ecx))
   (set (register esi) 0)
   (set (register eax) 5)
   (set (register edx) 7)
